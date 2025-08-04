@@ -9,12 +9,16 @@
     "dev": "tsc -w"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.6.1",
-    "pocketbase": "^0.26.1"
+    "@modelcontextprotocol/sdk": "^1.17.1",
+    "pocketbase": "^0.26.1",
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.15",
-    "dotenv": "^17.2.0",
+    "@types/express": "^4.17.23",
+    "@types/cors": "^2.8.19",
     "typescript": "^5.8.3"
   }
 }
