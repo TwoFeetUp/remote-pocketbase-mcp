@@ -889,9 +889,8 @@ class PocketBaseHTTPServer {
             this.transports.set(sessionId, transport);
             this.servers.set(sessionId, server);
           },
-          // Enable DNS rebinding protection for local development
-          enableDnsRebindingProtection: true,
-          allowedHosts: ['127.0.0.1', 'localhost', 'localhost:3000', '127.0.0.1:3000'],
+          // Disable DNS rebinding protection for production deployments
+          enableDnsRebindingProtection: false,
         });
 
         // Clean up transport when closed
