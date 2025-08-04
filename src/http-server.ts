@@ -1726,9 +1726,10 @@ class PocketBaseHTTPServer {
   async run() {
     const PORT = process.env.PORT || 3000;
     
-    // According to MCP spec, servers SHOULD bind only to localhost (127.0.0.1) when running locally
-    this.app.listen(PORT, '127.0.0.1', () => {
-      console.log(`PocketBase MCP HTTP server running on http://127.0.0.1:${PORT}/mcp`);
+    // Bind to 0.0.0.0 to allow external access when running in Docker
+    const HOST = process.env.HOST || '0.0.0.0';
+    this.app.listen(PORT, HOST, () => {
+      console.log(`PocketBase MCP HTTP server running on http://${HOST}:${PORT}/mcp`);
       console.log(`Protocol versions supported: 2025-06-18, 2025-03-26`);
       console.log(`All 24 tools available!`);
     });
