@@ -1,24 +1,131 @@
 #!/usr/bin/env node
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 import PocketBase from 'pocketbase';
+import express from 'express';
+import { randomUUID } from 'node:crypto';
+import cors from 'cors';
+import dotenv from 'dotenv';
 
+// Load environment variables
+dotenv.config();
 
+// Error handling functions
+function flattenErrors(errors: unknown): string[] {
+  if (Array.isArray(errors)) {
+    return errors.flatMap(flattenErrors);
+  } else if (typeof errors === "object" && errors !== null) {
+    const errorObject = errors as Record<string, any>;
 
-class PocketBaseServer {
-  private server: Server;
-  private pb: PocketBase;
+    // Handle objects with message property directly
+    if (errorObject.message) {
+      return [errorObject.message, ...flattenErrors(errorObject.data || {})];
+    }
+
+    // Handle nested objects with code/message structure
+    if (errorObject.data) {
+      const messages: string[] = [];
+
+      for (const key in errorObject.data) {
+        const value = errorObject.data[key];
+        if (typeof value === "object" && value !== null) {
+          // Always recursively process the value to extract all messages
+          messages.push(...flattenErrors(value));
+        }
+      }
+
+      if (messages.length > 0) {
+        return messages;
+      }
+    }
+
+    // Process all object values recursively
+    return Object.values(errorObject).flatMap(flattenErrors);
+  } else if (typeof errors === "string") {
+    return [errors];
+  } else {
+    return [];
+  }
+}
+
+function pocketbaseErrorMessage(errors: unknown): string {
+  const messages = flattenErrors(errors);
+  return messages.length > 0 ? messages.join("\n") : "No errors found";
+}
+
+// Session state management
+interface SessionState {
+  userPb?: PocketBase; // For authenticated user operations
+  adminPb?: PocketBase; // For admin operations
+  currentAuthToken?: string;
+  currentAuthRecord?: any;
+}
+
+class PocketBaseHTTPServer {
+  private app: express.Application;
+  private transports: Map<string, StreamableHTTPServerTransport> = new Map();
+  private servers: Map<string, Server> = new Map();
+  private sessionStates: Map<string, SessionState> = new Map();
 
   constructor() {
-    this.server = new Server(
+    // Verify PocketBase URL is set
+    const url = process.env.POCKETBASE_URL;
+    if (!url) {
+      throw new Error('POCKETBASE_URL environment variable is required');
+    }
+
+    // Initialize Express app
+    this.app = express();
+    this.app.use(express.json());
+    
+    // Configure CORS for browser-based clients
+    this.app.use(cors({
+      origin: '*', // Configure appropriately for production
+      exposedHeaders: ['Mcp-Session-Id'],
+      allowedHeaders: ['Content-Type', 'mcp-session-id', 'MCP-Protocol-Version'],
+    }));
+
+    this.setupHTTPEndpoints();
+  }
+
+  private getSessionState(sessionId: string): SessionState {
+    if (!this.sessionStates.has(sessionId)) {
+      this.sessionStates.set(sessionId, {});
+    }
+    return this.sessionStates.get(sessionId)!;
+  }
+
+  private getUserPocketBase(sessionId: string): PocketBase {
+    const state = this.getSessionState(sessionId);
+    if (!state.userPb) {
+      state.userPb = new PocketBase(process.env.POCKETBASE_URL!);
+      // Restore auth if we have a token
+      if (state.currentAuthToken && state.currentAuthRecord) {
+        state.userPb.authStore.save(state.currentAuthToken, state.currentAuthRecord);
+      }
+    }
+    return state.userPb;
+  }
+
+  private getAdminPocketBase(sessionId: string): PocketBase {
+    const state = this.getSessionState(sessionId);
+    if (!state.adminPb) {
+      state.adminPb = new PocketBase(process.env.POCKETBASE_URL!);
+    }
+    return state.adminPb;
+  }
+
+  private createServer(sessionId: string): Server {
+    const server = new Server(
       {
-        name: 'pocketbase-server',
+        name: 'pocketbase-http-server',
         version: '0.1.0',
       },
       {
@@ -28,25 +135,14 @@ class PocketBaseServer {
       }
     );
 
-    // Initialize PocketBase client
-    const url = process.env.POCKETBASE_URL;
-    if (!url) {
-      throw new Error('POCKETBASE_URL environment variable is required');
-    }
-    this.pb = new PocketBase(url);
-
-    this.setupToolHandlers();
+    this.setupToolHandlersForServer(server, sessionId);
+    server.onerror = (error) => console.error('[MCP Error]', error);
     
-    // Error handling
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
-    process.on('SIGINT', async () => {
-      await this.server.close();
-      process.exit(0);
-    });
+    return server;
   }
 
-  private setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  private setupToolHandlersForServer(server: Server, sessionId: string) {
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
           name: 'create_collection',
@@ -194,6 +290,55 @@ class PocketBaseServer {
                     description: 'Fields used for identity in password authentication',
                   },
                 },
+              },
+            },
+            required: ['collectionIdOrName'],
+          },
+        },
+        {
+          name: 'get_collection',
+          description: 'Get details for a collection',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              collectionIdOrName: {
+                type: 'string',
+                description: 'ID or name of the collection to view',
+              },
+              fields: {
+                type: 'string',
+                description: 'Comma separated string of the fields to return in the JSON response',
+              },
+            },
+            required: ['collectionIdOrName'],
+          },
+        },
+        {
+          name: 'list_collections',
+          description: 'List all collections in PocketBase',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              filter: {
+                type: 'string',
+                description: 'Filter query for collections',
+              },
+              sort: {
+                type: 'string',
+                description: 'Sort order for collections',
+              },
+            },
+          },
+        },
+        {
+          name: 'delete_collection',
+          description: 'Delete a collection from PocketBase (admin only)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              collectionIdOrName: {
+                type: 'string',
+                description: 'ID or name of the collection to delete',
               },
             },
             required: ['collectionIdOrName'],
@@ -575,24 +720,6 @@ class PocketBaseServer {
           },
         },
         {
-          name: 'get_collection',
-          description: 'Get details for a collection',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              collectionIdOrName: {
-                type: 'string',
-                description: 'ID or name of the collection to view',
-              },
-              fields: {
-                type: 'string',
-                description: 'Comma separated string of the fields to return in the JSON response',
-              },
-            },
-            required: ['collectionIdOrName'],
-          },
-        },
-        {
           name: 'backup_database',
           description: 'Create a backup of the PocketBase database',
           inputSchema: {
@@ -629,37 +756,6 @@ class PocketBaseServer {
               },
             },
             required: ['collection', 'data'],
-          },
-        },
-        {
-          name: 'list_collections',
-          description: 'List all collections in PocketBase',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              filter: {
-                type: 'string',
-                description: 'Filter query for collections',
-              },
-              sort: {
-                type: 'string',
-                description: 'Sort order for collections',
-              },
-            },
-          },
-        },
-        {
-          name: 'delete_collection',
-          description: 'Delete a collection from PocketBase (admin only)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              collectionIdOrName: {
-                type: 'string',
-                description: 'ID or name of the collection to delete',
-              },
-            },
-            required: ['collectionIdOrName'],
           },
         },
         {
@@ -702,35 +798,67 @@ class PocketBaseServer {
       ],
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
         switch (request.params.name) {
+          // Collection Management
           case 'create_collection':
-            return await this.createCollection(request.params.arguments);
+            return await this.createCollection(sessionId, request.params.arguments);
           case 'update_collection':
-            return await this.updateCollection(request.params.arguments);
-          case 'create_record':
-            return await this.createRecord(request.params.arguments);
-          case 'list_records':
-            return await this.listRecords(request.params.arguments);
-          case 'update_record':
-            return await this.updateRecord(request.params.arguments);
-          case 'delete_record':
-            return await this.deleteRecord(request.params.arguments);
-          case 'authenticate_user':
-            return await this.authenticateUser(request.params.arguments);
-          case 'create_user':
-            return await this.createUser(request.params.arguments);
+            return await this.updateCollection(sessionId, request.params.arguments);
           case 'get_collection':
-            return await this.getCollection(request.params.arguments);
-          case 'backup_database':
-            return await this.backupDatabase(request.params.arguments);
+            return await this.getCollection(sessionId, request.params.arguments);
           case 'list_collections':
-            return await this.listCollections(request.params.arguments);
+            return await this.listCollections(sessionId, request.params.arguments);
           case 'delete_collection':
-            return await this.deleteCollection(request.params.arguments);
+            return await this.deleteCollection(sessionId, request.params.arguments);
+          
+          // Record Management
+          case 'create_record':
+            return await this.createRecord(sessionId, request.params.arguments);
+          case 'list_records':
+            return await this.listRecords(sessionId, request.params.arguments);
+          case 'update_record':
+            return await this.updateRecord(sessionId, request.params.arguments);
+          case 'delete_record':
+            return await this.deleteRecord(sessionId, request.params.arguments);
+          
+          // Authentication & User Management
+          case 'list_auth_methods':
+            return await this.listAuthMethods(sessionId, request.params.arguments);
+          case 'authenticate_user':
+            return await this.authenticateUser(sessionId, request.params.arguments);
+          case 'authenticate_with_oauth2':
+            return await this.authenticateWithOAuth2(sessionId, request.params.arguments);
+          case 'authenticate_with_otp':
+            return await this.authenticateWithOtp(sessionId, request.params.arguments);
+          case 'auth_refresh':
+            return await this.authRefresh(sessionId, request.params.arguments);
+          case 'request_verification':
+            return await this.requestVerification(sessionId, request.params.arguments);
+          case 'confirm_verification':
+            return await this.confirmVerification(sessionId, request.params.arguments);
+          case 'request_password_reset':
+            return await this.requestPasswordReset(sessionId, request.params.arguments);
+          case 'confirm_password_reset':
+            return await this.confirmPasswordReset(sessionId, request.params.arguments);
+          case 'request_email_change':
+            return await this.requestEmailChange(sessionId, request.params.arguments);
+          case 'confirm_email_change':
+            return await this.confirmEmailChange(sessionId, request.params.arguments);
+          case 'impersonate_user':
+            return await this.impersonateUser(sessionId, request.params.arguments);
+          case 'create_user':
+            return await this.createUser(sessionId, request.params.arguments);
+          
+          // Data Management
+          case 'backup_database':
+            return await this.backupDatabase(sessionId, request.params.arguments);
+          case 'import_data':
+            return await this.importData(sessionId, request.params.arguments);
           case 'fetch_logs':
-            return await this.fetchLogs(request.params.arguments);
+            return await this.fetchLogs(sessionId, request.params.arguments);
+
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -749,10 +877,163 @@ class PocketBaseServer {
     });
   }
 
-  private async createCollection(args: any) {
+  private setupHTTPEndpoints() {
+    // Handle POST requests for client-to-server communication
+    this.app.post('/mcp', async (req, res) => {
+      // Check for required headers
+      const acceptHeader = req.headers['accept'];
+      if (!acceptHeader || !acceptHeader.includes('application/json') || !acceptHeader.includes('text/event-stream')) {
+        res.status(406).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Not Acceptable: Client must accept both application/json and text/event-stream',
+          },
+          id: null,
+        });
+        return;
+      }
+
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      const protocolVersion = req.headers['mcp-protocol-version'] as string || '2025-06-18';
+
+      // Validate protocol version
+      if (protocolVersion !== '2025-06-18' && protocolVersion !== '2025-03-26') {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: `Unsupported protocol version: ${protocolVersion}`,
+          },
+          id: null,
+        });
+        return;
+      }
+
+      let transport: StreamableHTTPServerTransport;
+      let server: Server;
+
+      if (sessionId && this.transports.has(sessionId)) {
+        // Reuse existing transport and server
+        transport = this.transports.get(sessionId)!;
+        server = this.servers.get(sessionId)!;
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        // New initialization request
+        const newSessionId = randomUUID();
+        
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => newSessionId,
+          onsessioninitialized: (sessionId) => {
+            // Store the transport and server by session ID
+            this.transports.set(sessionId, transport);
+            this.servers.set(sessionId, server);
+          },
+          // Disable DNS rebinding protection for production deployments
+          enableDnsRebindingProtection: false,
+        });
+
+        // Clean up transport when closed
+        transport.onclose = () => {
+          if (transport.sessionId) {
+            this.transports.delete(transport.sessionId);
+            this.servers.delete(transport.sessionId);
+            this.sessionStates.delete(transport.sessionId);
+          }
+        };
+
+        // Create a new server instance for this session
+        server = this.createServer(newSessionId);
+
+        // Connect to the session server
+        await server.connect(transport);
+      } else if (sessionId && !this.transports.has(sessionId)) {
+        // Session not found
+        res.status(404).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Session not found',
+          },
+          id: null,
+        });
+        return;
+      } else {
+        // Invalid request - no session ID for non-initialize request
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Bad Request: Session ID required for non-initialize requests',
+          },
+          id: null,
+        });
+        return;
+      }
+
+      // Handle the request
+      await transport.handleRequest(req, res, req.body);
+    });
+
+    // Handle GET requests for server-to-client notifications via SSE
+    this.app.get('/mcp', async (req, res) => {
+      const acceptHeader = req.headers['accept'];
+      if (!acceptHeader || !acceptHeader.includes('text/event-stream')) {
+        res.status(405).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Method not allowed: GET requires Accept: text/event-stream',
+          },
+          id: null,
+        });
+        return;
+      }
+
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !this.transports.has(sessionId)) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      
+      const transport = this.transports.get(sessionId)!;
+      await transport.handleRequest(req, res);
+    });
+
+    // Handle DELETE requests for session termination
+    this.app.delete('/mcp', async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !this.transports.has(sessionId)) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      
+      const transport = this.transports.get(sessionId)!;
+      const server = this.servers.get(sessionId)!;
+      
+      // Clean up
+      await server.close();
+      transport.close();
+      this.transports.delete(sessionId);
+      this.servers.delete(sessionId);
+      this.sessionStates.delete(sessionId);
+      
+      res.status(200).send('Session terminated');
+    });
+  }
+
+  // Collection Management Tool implementations
+  private async createCollection(sessionId: string, args: any) {
     try {
-      // Authenticate with PocketBase
-      await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
+      // Admin operations always use a separate PB instance
+      const adminPb = this.getAdminPocketBase(sessionId);
+      
+      // Ensure admin is authenticated
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
 
       const defaultFields = [
         {
@@ -782,7 +1063,7 @@ class PocketBaseServer {
         fields: [...(args.fields || []), ...defaultFields]
       };
 
-      const result = await this.pb.collections.create(collectionData as any);
+      const result = await adminPb.collections.create(collectionData as any);
       return {
         content: [
           {
@@ -799,13 +1080,19 @@ class PocketBaseServer {
     }
   }
 
-  private async updateCollection(args: any) {
+  private async updateCollection(sessionId: string, args: any) {
     try {
-      // Authenticate with PocketBase as admin
-      await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
+      const adminPb = this.getAdminPocketBase(sessionId);
+      
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
 
       const { collectionIdOrName, ...updateData } = args;
-      const result = await this.pb.collections.update(collectionIdOrName, updateData as any);
+      const result = await adminPb.collections.update(collectionIdOrName, updateData as any);
       return {
         content: [
           {
@@ -822,9 +1109,110 @@ class PocketBaseServer {
     }
   }
 
-  private async createRecord(args: any) {
+  private async getCollection(sessionId: string, args: any) {
     try {
-      const result = await this.pb.collection(args.collection).create(args.data);
+      const adminPb = this.getAdminPocketBase(sessionId);
+      
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
+      
+      const collection = await adminPb.collections.getOne(args.collectionIdOrName, {
+        fields: args.fields
+      });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(collection, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get collection: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async listCollections(sessionId: string, args: any) {
+    try {
+      // Admin operations always use a separate PB instance
+      const adminPb = this.getAdminPocketBase(sessionId);
+      
+      // Ensure admin is authenticated
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
+
+      let collections;
+      if (args.filter) {
+        collections = await adminPb.collections.getFirstListItem(args.filter);
+      } else if (args.sort) {
+        collections = await adminPb.collections.getFullList({ sort: args.sort });
+      } else {
+        collections = await adminPb.collections.getList(1, 100);
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(collections, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to list collections: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async deleteCollection(sessionId: string, args: any) {
+    try {
+      const adminPb = this.getAdminPocketBase(sessionId);
+      
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
+      
+      await adminPb.collections.delete(args.collectionIdOrName);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Successfully deleted collection ${args.collectionIdOrName}`,
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to delete collection: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  // Record Management Tool implementations
+  private async createRecord(sessionId: string, args: any) {
+    try {
+      // Use the user's authenticated PB instance
+      const pb = this.getUserPocketBase(sessionId);
+      const result = await pb.collection(args.collection).create(args.data);
       return {
         content: [
           {
@@ -841,7 +1229,7 @@ class PocketBaseServer {
     }
   }
 
-  private async listRecords(args: any) {
+  private async listRecords(sessionId: string, args: any) {
     try {
       const options: any = {};
       if (args.filter) options.filter = args.filter;
@@ -849,7 +1237,9 @@ class PocketBaseServer {
       if (args.page) options.page = args.page;
       if (args.perPage) options.perPage = args.perPage;
 
-      const result = await this.pb.collection(args.collection).getList(
+      // Use the user's authenticated PB instance
+      const pb = this.getUserPocketBase(sessionId);
+      const result = await pb.collection(args.collection).getList(
         options.page || 1,
         options.perPage || 50,
         {
@@ -874,9 +1264,10 @@ class PocketBaseServer {
     }
   }
 
-  private async updateRecord(args: any) {
+  private async updateRecord(sessionId: string, args: any) {
     try {
-      const result = await this.pb
+      const pb = this.getUserPocketBase(sessionId);
+      const result = await pb
         .collection(args.collection)
         .update(args.id, args.data);
       return {
@@ -895,9 +1286,10 @@ class PocketBaseServer {
     }
   }
 
-  private async deleteRecord(args: any) {
+  private async deleteRecord(sessionId: string, args: any) {
     try {
-      await this.pb.collection(args.collection).delete(args.id);
+      const pb = this.getUserPocketBase(sessionId);
+      await pb.collection(args.collection).delete(args.id);
       return {
         content: [
           {
@@ -914,22 +1306,106 @@ class PocketBaseServer {
     }
   }
 
-  private async authenticateUser(args: any) {
+  // Authentication Tool implementations
+  private async listAuthMethods(sessionId: string, args: any) {
     try {
-      // Use _superusers collection for admin authentication
-      const collection = args.isAdmin ? '_superusers' : (args.collection || 'users');
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      const authMethods = await pb.collection(collection).listAuthMethods();
       
-      // For admin authentication, use environment variables if email/password not provided
-      const email = args.isAdmin && !args.email ? process.env.POCKETBASE_ADMIN_EMAIL : args.email;
-      const password = args.isAdmin && !args.password ? process.env.POCKETBASE_ADMIN_PASSWORD : args.password;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(authMethods, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to list auth methods: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async authenticateUser(sessionId: string, args: any) {
+    try {
+      const state = this.getSessionState(sessionId);
       
-      if (!email || !password) {
-        throw new Error('Email and password are required for authentication');
+      if (args.isAdmin) {
+        // Admin authentication uses the admin PB instance
+        const adminPb = this.getAdminPocketBase(sessionId);
+        const collection = '_superusers';
+        
+        const email = args.email || process.env.POCKETBASE_ADMIN_EMAIL;
+        const password = args.password || process.env.POCKETBASE_ADMIN_PASSWORD;
+        
+        if (!email || !password) {
+          throw new Error('Email and password are required for authentication');
+        }
+        
+        const authData = await adminPb
+          .collection(collection)
+          .authWithPassword(email, password);
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(authData, null, 2),
+            },
+          ],
+        };
+      } else {
+        // User authentication uses the user PB instance
+        const userPb = this.getUserPocketBase(sessionId);
+        const collection = args.collection || 'users';
+        
+        if (!args.email || !args.password) {
+          throw new Error('Email and password are required for authentication');
+        }
+        
+        const authData = await userPb
+          .collection(collection)
+          .authWithPassword(args.email, args.password);
+        
+        // Save the auth state
+        state.currentAuthToken = userPb.authStore.token;
+        state.currentAuthRecord = userPb.authStore.record;
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(authData, null, 2),
+            },
+          ],
+        };
       }
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Authentication failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async authenticateWithOAuth2(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
       
-      const authData = await this.pb
-        .collection(collection)
-        .authWithPassword(email, password);
+      const authData = await pb.collection(collection).authWithOAuth2Code(
+        args.provider,
+        args.code,
+        args.codeVerifier,
+        args.redirectUrl
+      );
+      
+      const state = this.getSessionState(sessionId);
+      state.currentAuthToken = pb.authStore.token;
+      state.currentAuthRecord = pb.authStore.record;
       
       return {
         content: [
@@ -942,15 +1418,248 @@ class PocketBaseServer {
     } catch (error: unknown) {
       throw new McpError(
         ErrorCode.InternalError,
-        `Authentication failed: ${pocketbaseErrorMessage(error)}`
+        `OAuth2 authentication failed: ${pocketbaseErrorMessage(error)}`
       );
     }
   }
 
-  private async createUser(args: any) {
+  private async authenticateWithOtp(sessionId: string, args: any) {
     try {
+      const pb = this.getUserPocketBase(sessionId);
       const collection = args.collection || 'users';
-      const result = await this.pb.collection(collection).create({
+      
+      const result = await pb.collection(collection).requestOTP(args.email);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `OTP request failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async authRefresh(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const authData = await pb.collection(collection).authRefresh();
+      
+      const state = this.getSessionState(sessionId);
+      state.currentAuthToken = pb.authStore.token;
+      state.currentAuthRecord = pb.authStore.record;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(authData, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Auth refresh failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async requestVerification(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const result = await pb.collection(collection).requestVerification(args.email);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Verification request failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async confirmVerification(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const result = await pb.collection(collection).confirmVerification(args.token);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Verification confirmation failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async requestPasswordReset(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const result = await pb.collection(collection).requestPasswordReset(args.email);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Password reset request failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async confirmPasswordReset(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const result = await pb.collection(collection).confirmPasswordReset(
+        args.token,
+        args.password,
+        args.passwordConfirm
+      );
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Password reset confirmation failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async requestEmailChange(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const result = await pb.collection(collection).requestEmailChange(args.newEmail);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Email change request failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async confirmEmailChange(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      
+      const result = await pb.collection(collection).confirmEmailChange(
+        args.token,
+        args.password
+      );
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Email change confirmation failed: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async impersonateUser(sessionId: string, args: any) {
+    try {
+      const adminPb = this.getAdminPocketBase(sessionId);
+      
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
+      
+      const result = await adminPb.collections.authWithPassword(
+        args.collectionIdOrName || 'users',
+        args.id,
+        '',
+        {
+          expand: args.expand,
+          fields: args.fields,
+        }
+      );
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to impersonate user: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async createUser(sessionId: string, args: any) {
+    try {
+      const pb = this.getUserPocketBase(sessionId);
+      const collection = args.collection || 'users';
+      const result = await pb.collection(collection).create({
         email: args.email,
         password: args.password,
         passwordConfirm: args.passwordConfirm,
@@ -972,39 +1681,19 @@ class PocketBaseServer {
     }
   }
 
-  private async getCollection(args: any) {
+  // Data Management Tool implementations
+  private async backupDatabase(sessionId: string, args: any) {
     try {
-      // Authenticate with PocketBase
-      await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
+      const adminPb = this.getAdminPocketBase(sessionId);
       
-      // Get collection details
-      const collection = await this.pb.collections.getOne(args.collectionIdOrName, {
-        fields: args.fields
-      });
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '', 
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
       
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(collection, null, 2),
-          },
-        ],
-      };
-    } catch (error: unknown) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to get collection: ${pocketbaseErrorMessage(error)}`
-      );
-    }
-  }
-
-  private async backupDatabase(args: any) {
-    try {
-      // Authenticate with PocketBase
-      await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
-      
-      // Create a new backup
-      const backupResult = await this.pb.backups.create(args.name ?? '', {});
+      const backupResult = await adminPb.backups.create(args.name ?? '', {});
       
       return {
         content: [
@@ -1022,68 +1711,67 @@ class PocketBaseServer {
     }
   }
 
-  private async listCollections(args: any) {
+  private async importData(sessionId: string, args: any) {
     try {
-      // Authenticate with PocketBase
-      await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
+      const pb = this.getUserPocketBase(sessionId);
+      const mode = args.mode || 'create';
+      const results = [];
 
-      // Fetch collections based on provided arguments
-      let collections;
-      if (args.filter) {
-        collections = await this.pb.collections.getFirstListItem(args.filter);
-      } else if (args.sort) {
-        collections = await this.pb.collections.getFullList({ sort: args.sort });
-      } else {
-        collections = await this.pb.collections.getList(1, 100);
+      for (const record of args.data) {
+        try {
+          let result;
+          if (mode === 'create') {
+            result = await pb.collection(args.collection).create(record);
+          } else if (mode === 'update' && record.id) {
+            result = await pb.collection(args.collection).update(record.id, record);
+          } else if (mode === 'upsert') {
+            if (record.id) {
+              try {
+                result = await pb.collection(args.collection).update(record.id, record);
+              } catch {
+                result = await pb.collection(args.collection).create(record);
+              }
+            } else {
+              result = await pb.collection(args.collection).create(record);
+            }
+          }
+          results.push({ success: true, record: result });
+        } catch (error) {
+          results.push({ success: false, error: pocketbaseErrorMessage(error), record });
+        }
       }
 
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(collections, null, 2),
+            text: JSON.stringify({
+              imported: results.filter(r => r.success).length,
+              failed: results.filter(r => !r.success).length,
+              results
+            }, null, 2),
           },
         ],
       };
     } catch (error: unknown) {
       throw new McpError(
         ErrorCode.InternalError,
-        `Failed to list collections: ${pocketbaseErrorMessage(error)}`
+        `Import failed: ${pocketbaseErrorMessage(error)}`
       );
     }
   }
 
-  private async deleteCollection(args: any) {
-    try {
-      // Authenticate with PocketBase as admin (required for collection deletion)
-      await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
-
-      // Delete the collection
-      await this.pb.collections.delete(args.collectionIdOrName);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Successfully deleted collection ${args.collectionIdOrName}`,
-          },
-        ],
-      };
-    } catch (error: unknown) {
-      throw new McpError(
-        ErrorCode.InternalError,
-        `Failed to delete collection: ${pocketbaseErrorMessage(error)}`
-      );
-    }
-  }
-
-  private async fetchLogs(args: any) {
+  private async fetchLogs(sessionId: string, args: any) {
     try {
       // Authenticate with PocketBase as admin (logs require admin access)
-      await this.pb.collection("_superusers").authWithPassword(
-        process.env.POCKETBASE_ADMIN_EMAIL ?? '',
-        process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
-      );
+      const adminPb = this.getAdminPocketBase(sessionId);
+
+      if (!adminPb.authStore.isValid) {
+        await adminPb.collection("_superusers").authWithPassword(
+          process.env.POCKETBASE_ADMIN_EMAIL ?? '',
+          process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+        );
+      }
 
       // Build filter query
       let filter = args.filter || '';
@@ -1110,7 +1798,7 @@ class PocketBaseServer {
       if (args.sort) params.append('sort', args.sort);
 
       // Fetch logs via /api/logs endpoint
-      const response = await this.pb.send(`/api/logs?${params.toString()}`, {
+      const response = await adminPb.send(`/api/logs?${params.toString()}`, {
         method: 'GET',
       });
 
@@ -1161,54 +1849,17 @@ class PocketBaseServer {
   }
 
   async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('PocketBase MCP server running on stdio');
+    const PORT = process.env.PORT || 3000;
+    
+    // Bind to 0.0.0.0 to allow external access when running in Docker
+    const HOST = process.env.HOST || '0.0.0.0';
+    this.app.listen(PORT, HOST, () => {
+      console.log(`PocketBase MCP HTTP server running on http://${HOST}:${PORT}/mcp`);
+      console.log(`Protocol versions supported: 2025-06-18, 2025-03-26`);
+      console.log(`All 24 tools available!`);
+    });
   }
 }
 
-const server = new PocketBaseServer();
+const server = new PocketBaseHTTPServer();
 server.run().catch(console.error);
-
-
-export function flattenErrors(errors: unknown): string[] {
-  if (Array.isArray(errors)) {
-    return errors.flatMap(flattenErrors);
-  } else if (typeof errors === "object" && errors !== null) {
-    const errorObject = errors as Record<string, any>;
-
-    // Handle objects with message property directly
-    if (errorObject.message) {
-      return [errorObject.message, ...flattenErrors(errorObject.data || {})];
-    }
-
-    // Handle nested objects with code/message structure
-    if (errorObject.data) {
-      const messages: string[] = [];
-
-      for (const key in errorObject.data) {
-        const value = errorObject.data[key];
-        if (typeof value === "object" && value !== null) {
-          // Always recursively process the value to extract all messages
-          messages.push(...flattenErrors(value));
-        }
-      }
-
-      if (messages.length > 0) {
-        return messages;
-      }
-    }
-
-    // Process all object values recursively
-    return Object.values(errorObject).flatMap(flattenErrors);
-  } else if (typeof errors === "string") {
-    return [errors];
-  } else {
-    return [];
-  }
-}
-
-export function pocketbaseErrorMessage(errors: unknown): string {
-  const messages = flattenErrors(errors);
-  return messages.length > 0 ? messages.join("\n") : "No errors found";
-}
