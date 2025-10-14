@@ -662,6 +662,43 @@ class PocketBaseServer {
             required: ['collectionIdOrName'],
           },
         },
+        {
+          name: 'fetch_logs',
+          description: 'Fetch and search PocketBase logs for debugging. This tool provides MORE DETAILED ERROR INFORMATION than standard API responses, including full stack traces, validation details, and request context. Use this when you\'re stuck debugging an issue and need to see exactly what went wrong on the server.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              filter: {
+                type: 'string',
+                description: 'Filter query (e.g., "data.status >= 400" for errors, "data.url ~ \'views\'" for specific endpoint)',
+              },
+              search: {
+                type: 'string',
+                description: 'Search term to find in URL, error messages, or details (searches data.url, data.error, and data.details fields)',
+              },
+              page: {
+                type: 'number',
+                description: 'Page number (default: 1)',
+                default: 1,
+              },
+              perPage: {
+                type: 'number',
+                description: 'Items per page (default: 50, max: 100)',
+                default: 50,
+              },
+              sort: {
+                type: 'string',
+                description: 'Sort order (default: "-created" for newest first)',
+                default: '-created',
+              },
+              errorsOnly: {
+                type: 'boolean',
+                description: 'Show only errors (status >= 400). Shortcut for filter: "data.status >= 400"',
+                default: false,
+              },
+            },
+          },
+        },
       ],
     }));
 
@@ -692,6 +729,8 @@ class PocketBaseServer {
             return await this.listCollections(request.params.arguments);
           case 'delete_collection':
             return await this.deleteCollection(request.params.arguments);
+          case 'fetch_logs':
+            return await this.fetchLogs(request.params.arguments);
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -1018,10 +1057,10 @@ class PocketBaseServer {
     try {
       // Authenticate with PocketBase as admin (required for collection deletion)
       await this.pb.collection("_superusers").authWithPassword(process.env.POCKETBASE_ADMIN_EMAIL ?? '', process.env.POCKETBASE_ADMIN_PASSWORD ?? '');
-      
+
       // Delete the collection
       await this.pb.collections.delete(args.collectionIdOrName);
-      
+
       return {
         content: [
           {
@@ -1034,6 +1073,89 @@ class PocketBaseServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to delete collection: ${pocketbaseErrorMessage(error)}`
+      );
+    }
+  }
+
+  private async fetchLogs(args: any) {
+    try {
+      // Authenticate with PocketBase as admin (logs require admin access)
+      await this.pb.collection("_superusers").authWithPassword(
+        process.env.POCKETBASE_ADMIN_EMAIL ?? '',
+        process.env.POCKETBASE_ADMIN_PASSWORD ?? ''
+      );
+
+      // Build filter query
+      let filter = args.filter || '';
+
+      // Handle errorsOnly shortcut
+      if (args.errorsOnly) {
+        filter = filter ? `(${filter}) && data.status >= 400` : 'data.status >= 400';
+      }
+
+      // Handle search parameter
+      if (args.search) {
+        const searchTerm = args.search;
+        const searchFilter = `data.url ~ "${searchTerm}" || data.error ~ "${searchTerm}" || data.details ~ "${searchTerm}"`;
+        filter = filter ? `(${filter}) && (${searchFilter})` : searchFilter;
+      }
+
+      // Build query parameters
+      const params = new URLSearchParams({
+        page: (args.page || 1).toString(),
+        perPage: Math.min(args.perPage || 50, 100).toString(),
+      });
+
+      if (filter) params.append('filter', filter);
+      if (args.sort) params.append('sort', args.sort);
+
+      // Fetch logs via /api/logs endpoint
+      const response = await this.pb.send(`/api/logs?${params.toString()}`, {
+        method: 'GET',
+      });
+
+      // Format the response for better readability
+      const formattedResponse = {
+        summary: {
+          totalItems: response.totalItems || response.items?.length || 0,
+          itemsShown: response.items?.length || 0,
+          page: response.page || args.page || 1,
+          perPage: response.perPage || args.perPage || 50,
+          filter: filter || 'none',
+        },
+        logs: response.items?.map((log: any) => ({
+          id: log.id,
+          created: log.created,
+          level: log.level,
+          message: log.message,
+          data: {
+            method: log.data?.method,
+            url: log.data?.url,
+            status: log.data?.status,
+            error: log.data?.error,
+            details: log.data?.details,
+            userIP: log.data?.userIP,
+            userAgent: log.data?.userAgent,
+            referer: log.data?.referer,
+            auth: log.data?.auth,
+            execTime: log.data?.execTime,
+            type: log.data?.type,
+          }
+        })) || [],
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(formattedResponse, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to fetch logs: ${pocketbaseErrorMessage(error)}`
       );
     }
   }

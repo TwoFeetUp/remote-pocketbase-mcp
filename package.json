@@ -10,15 +10,15 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.1",
-    "pocketbase": "^0.26.1",
-    "express": "^4.21.2",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.0"
+    "dotenv": "^17.2.0",
+    "express": "^4.21.2",
+    "pocketbase": "^0.26.1"
   },
   "devDependencies": {
-    "@types/node": "^24.0.15",
-    "@types/express": "^4.17.23",
     "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.23",
+    "@types/node": "^24.7.2",
     "typescript": "^5.8.3"
   }
 }
