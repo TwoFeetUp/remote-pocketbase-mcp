@@ -1,14 +1,14 @@
 # Use an official Node.js image as a base
-FROM node:20-alpine
+FROM node:22.23.4-alpine
 
 # Set the working directory in the container
 WORKDIR /app
 
 # Copy package.json and tsconfig.json to the working directory
-COPY package.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json ./
 
 # Install project dependencies
-RUN npm install
+RUN npm ci
 
 # Install tsx for running TypeScript directly
 RUN npm install -g tsx
