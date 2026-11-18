@@ -40,7 +40,7 @@ This project exposes PocketBase functionality through the Model Context Protocol
 ## Installation
 
 ```bash
-npm install
+bun install --frozen-lockfile
 ```
 
 ## Configuration
@@ -64,13 +64,13 @@ POCKETBASE_ADMIN_PASSWORD=your-secure-password
 
 ```bash
 # Build the project
-npm run build
+bun run build
 
 # Start the server
-npm start
+bun run start
 
 # Or run in development mode with watch
-npm run dev
+bun run dev
 ```
 
 The server will start on `http://localhost:3000`.
@@ -176,7 +176,7 @@ remote-pocketbase-mcp/
 ### Building
 
 ```bash
-npm run build
+bun run build
 ```
 
 This compiles TypeScript to JavaScript in the `build/` directory and sets executable permissions on the entry point.
@@ -201,3 +201,14 @@ See repository for license information.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
+
+## Locked Docker installation
+
+`package.json` pins each dependency exactly and `bun.lock` pins the full dependency tree.
+Docker uses Bun 1.4.4 with `bun install --frozen-lockfile`. The existing Node/tsx
+runtime is preserved; tsx is now a pinned local dependency instead of a global install.
+
+To check the image without deploying: `docker build -t remote-pocketbase-mcp .`.
+The existing TypeScript build reports errors in collection authentication and the
+port type on the unmodified upstream branch as well; the Docker runtime transpiles
+with tsx as before.
